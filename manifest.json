@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "ofs.jradio",
+  "name": "JPopsuki Radio",
+  "version": "1.0.0",
+  "author": "ofs_dave",
+  "license": "MIT",
+  "description": "Tune into the public JPopsuki Radio Icecast stream from the Omarchy bar, with now-playing metadata and mpv/MPRIS playback.",
+  "keywords": [
+    "radio",
+    "jpop",
+    "jpopsuki",
+    "icecast",
+    "music",
+    "mpris"
+  ],
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "JPopsuki Radio",
+    "description": "Play JPopsuki Radio and show the current track",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTitle": true,
+      "preferMount": "stream"
+    },
+    "schema": [
+      {
+        "key": "showTitle",
+        "type": "boolean",
+        "label": "Show track title in bar",
+        "defaultValue": true,
+        "description": "When playing, append the current song next to the radio glyph."
+      },
+      {
+        "key": "preferMount",
+        "type": "enum",
+        "label": "Stream mount",
+        "options": ["stream", "autodj"],
+        "defaultValue": "stream",
+        "description": "Icecast mount to tune. Both carry the same AutoDJ feed; stream matches Centova's published tune-in URL."
+      }
+    ]
+  }
+}

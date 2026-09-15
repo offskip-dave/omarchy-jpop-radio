@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Headless mpv controller for ofs.jradio.
+# Usage: jradio-player start [url] | stop | toggle [url] | status
+set -euo pipefail
+umask 077
+
+: "${XDG_RUNTIME_DIR:?jradio-player requires XDG_RUNTIME_DIR}"
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+version=$(jq -r '.version // "1.0.0"' "$script_dir/manifest.json" 2>/dev/null || echo "1.0.0")
+user_agent="ofs.jradio/${version} (Omarchy Quattro; +http://jpopsuki.eu/media.php)"
+player_title="JPopsuki Radio"
+default_url="http://jpopsuki.fm:8000/stream"
+
+runtime_dir="$XDG_RUNTIME_DIR/ofs-jradio"
+socket="$runtime_dir/mpv.sock"
+pid_file="$runtime_dir/player.pid"
+url_file="$runtime_dir/url.txt"
+log_file="$runtime_dir/mpv.log"
+
+install -d -m 700 "$runtime_dir"
+exec 8>"$runtime_dir/player.lock"
+
+process_start_time() {
+  local pid=$1
+  [[ -r /proc/$pid/stat ]] || return 1
+  awk '$3 != "Z" { print $22 }' "/proc/$pid/stat" 2>/dev/null
+}
+
+player_alive() {
+  local pid expected_start actual_start
+  [[ -s $pid_file ]] || return 1
+  read -r pid expected_start < "$pid_file" || return 1
+  [[ $pid =~ ^[0-9]+$ && $expected_start =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  actual_start=$(process_start_time "$pid") || return 1
+  [[ $actual_start == "$expected_start" ]]
+}
+
+write_player_pid() {
+  local pid=$1
+  local start_time temporary
+  start_time=$(process_start_time "$pid") || return 1
+  temporary=$(mktemp "$runtime_dir/player.XXXXXX")
+  printf '%s %s\n' "$pid" "$start_time" > "$temporary"
+  mv "$temporary" "$pid_file"
+}
+
+cleanup_dead_player() {
+  player_alive && return
+  rm -f "$pid_file" "$socket"
+}
+
+terminate_tracked_player() {
+  local pid
+  player_alive || return 0
+  read -r pid _ < "$pid_file"
+  kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    player_alive || break
+    sleep 0.02
+  done
+  if player_alive; then
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      player_alive || break
+      sleep 0.02
+    done
+  fi
+  player_alive && return 1
+  cleanup_dead_player
+}
+
+send_command() {
+  local payload=$1
+  [[ -S $socket ]] || return 1
+  printf '%s\n' "$payload" | socat - "UNIX-CONNECT:$socket" >/dev/null 2>&1
+}
+
+current_url() {
+  if [[ -s $url_file ]]; then
+    tr -d '\r\n' < "$url_file"
+  else
+    printf '%s\n' "$default_url"
+  fi
+}
+
+status_json() {
+  local playing=false pid=0 url
+  url=$(current_url)
+  if player_alive; then
+    playing=true
+    read -r pid _ < "$pid_file"
+  else
+    cleanup_dead_player
+  fi
+  jq -cn \
+    --argjson playing "$playing" \
+    --argjson pid "$pid" \
+    --arg url "$url" \
+    --arg title "$player_title" \
+    '{playing:$playing,pid:$pid,url:$url,title:$title}'
+}
+
+safe_url() {
+  local url=$1
+  [[ $url =~ ^https?:// ]] || return 1
+  [[ $url != *$'\n'* && $url != *$'\r'* ]] || return 1
+  return 0
+}
+
+cmd_start() {
+  local url=${1:-$default_url}
+  safe_url "$url" || { echo 'jradio-player: refusing non-http(s) URL' >&2; exit 2; }
+
+  flock -x 8
+  if player_alive; then
+    # Already playing: retarget if the URL changed.
+    if [[ $(current_url) == "$url" ]]; then
+      status_json
+      return 0
+    fi
+    printf '%s\n' "$url" > "$url_file"
+    if send_command "$(jq -cn --arg u "$url" '{command:["loadfile",$u,"replace"]}')"; then
+      status_json
+      return 0
+    fi
+    terminate_tracked_player || true
+  fi
+
+  printf '%s\n' "$url" > "$url_file"
+  rm -f "$socket"
+
+  setsid mpv \
+    --no-video \
+    --force-window=no \
+    --audio-display=no \
+    --idle=no \
+    --loop-playlist=inf \
+    --cache-secs=20 \
+    --demuxer-max-bytes=8MiB \
+    --demuxer-max-back-bytes=2MiB \
+    --network-timeout=30 \
+    --user-agent="$user_agent" \
+    --title="$player_title" \
+    --force-media-title="$player_title" \
+    --input-ipc-server="$socket" \
+    --no-terminal \
+    --really-quiet \
+    "$url" \
+    >"$log_file" 2>&1 8>&- &
+  local player_pid=$!
+
+  if ! write_player_pid "$player_pid"; then
+    kill -- "-$player_pid" 2>/dev/null || kill "$player_pid" 2>/dev/null || true
+    wait "$player_pid" 2>/dev/null || true
+    rm -f "$pid_file" "$socket"
+    echo 'jradio-player: could not start mpv' >&2
+    exit 4
+  fi
+
+  for _ in $(seq 1 150); do
+    [[ -S $socket ]] && break
+    sleep 0.02
+  done
+  if [[ ! -S $socket ]]; then
+    # Socket can lag; still treat as started if the process lives.
+    if ! player_alive; then
+      rm -f "$pid_file" "$socket"
+      echo 'jradio-player: mpv exited early; see '"$log_file" >&2
+      exit 4
+    fi
+  fi
+
+  status_json
+}
+
+cmd_stop() {
+  flock -x 8
+  terminate_tracked_player || true
+  rm -f "$socket"
+  status_json
+}
+
+cmd_toggle() {
+  local url=${1:-}
+  flock -x 8
+  if player_alive; then
+    terminate_tracked_player || true
+    rm -f "$socket"
+    status_json
+  else
+    # Release lock before start (start re-acquires).
+    flock -u 8
+    cmd_start "${url:-$(current_url)}"
+  fi
+}
+
+cmd_status() {
+  flock -x 8
+  status_json
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "${1:-$default_url}" ;;
+  stop) cmd_stop ;;
+  toggle) shift; cmd_toggle "${1:-}" ;;
+  status) cmd_status ;;
+  *)
+    echo "Usage: jradio-player start [url] | stop | toggle [url] | status" >&2
+    exit 1
+    ;;
+esac
