@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Bounded HTTPS fetch helpers for ofs.jradio.
+# Usage:
+#   jradio-fetch meta
+#   jradio-fetch art <https-url>
+set -euo pipefail
+umask 077
+
+: "${XDG_RUNTIME_DIR:?jradio-fetch requires XDG_RUNTIME_DIR}"
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+version=$(jq -r '.version // "1.1.0"' "$script_dir/manifest.json" 2>/dev/null || echo "1.1.0")
+user_agent="ofs.jradio/${version} (Omarchy Quattro; +https://jpopsuki.eu/media.php)"
+
+# HTTPS-only Centova JSON. Fail closed on bad/mismatched certificates.
+meta_url="https://jpopsuki.fm:2199/rpc/jpopsuki/streaminfo.get"
+max_meta_bytes=65536
+max_art_bytes=524288
+max_art_edge=1024
+max_meta_time=8
+max_art_time=10
+
+runtime_dir="$XDG_RUNTIME_DIR/ofs-jradio"
+art_dir="$runtime_dir/art"
+install -d -m 700 "$runtime_dir" "$art_dir"
+
+is_https_url() {
+  local url=$1
+  [[ $url =~ ^https://[^[:space:]/]+ ]] || return 1
+  [[ $url != *$'\n'* && $url != *$'\r'* && $url != *$'\0'* ]] || return 1
+  (( ${#url} <= 512 )) || return 1
+  return 0
+}
+
+art_host_allowed() {
+  local host=$1
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  [[ -n $host && $host != *..* ]] || return 1
+  [[ $host == "lastfm.freetls.fastly.net" || $host == *.lastfm.freetls.fastly.net ]] && return 0
+  [[ $host == "last.fm" || $host == *.last.fm ]] && return 0
+  return 1
+}
+
+empty_meta_json() {
+  jq -cn '{type:"result",data:[{title:"JPopsuki Radio",song:"",track:{},listeners:0,bitrate:"",offline:true,serverstate:false}]}'
+}
+
+cmd_meta() {
+  local response
+  response=$(mktemp "$runtime_dir/meta.XXXXXX")
+  # --proto '=https' refuses plaintext redirects; --max-filesize caps the body.
+  if ! curl -fsS \
+      --proto '=https' --proto-redir '=https' \
+      --connect-timeout 4 --max-time "$max_meta_time" \
+      --max-filesize "$max_meta_bytes" \
+      -A "$user_agent" \
+      -o "$response" \
+      "$meta_url" 2>/dev/null
+  then
+    rm -f "$response"
+    empty_meta_json
+    return 0
+  fi
+
+  local size
+  size=$(stat -c '%s' -- "$response" 2>/dev/null || echo 0)
+  if (( size <= 0 || size > max_meta_bytes )); then
+    rm -f "$response"
+    empty_meta_json
+    return 0
+  fi
+
+  if ! jq -e '
+    (.type == "result")
+    and ((.data | type) == "array")
+    and ((.data | length) >= 1)
+    and ((.data | length) <= 4)
+  ' "$response" >/dev/null 2>&1; then
+    rm -f "$response"
+    empty_meta_json
+    return 0
+  fi
+
+  # Emit a size-bounded projection — never the unbounded raw object graph.
+  jq -c --argjson maxBytes "$max_meta_bytes" '
+    def clean($n):
+      if type != "string" then ""
+      else gsub("[\\u0000-\\u001f\\u007f]"; "") | gsub("[<>&`]"; "") | gsub("\\s+"; " ") | .[0:$n] end;
+    .data[0] as $r
+    | ($r.track // {}) as $t
+    | {
+        type: "result",
+        data: [{
+          title: ($r.title | clean(80)),
+          song: (($r.song // $r.rawmeta // "") | clean(200)),
+          track: {
+            artist: (($t.artist // "") | clean(120)),
+            title: (($t.title // "") | clean(120)),
+            album: (($t.album // "") | clean(120)),
+            imageurl: ((if ($t.imageurl | type) == "string" then $t.imageurl else "" end) | clean(512))
+          },
+          listeners: (
+            (($r.listeners // $r.listenertotal // 0) | tonumber? // 0)
+            | if . < 0 then 0 elif . > 1000000 then 1000000 else floor end
+          ),
+          bitrate: (($r.bitrate // "") | clean(32)),
+          offline: ($r.offline == true),
+          serverstate: ($r.serverstate == true),
+          server: (($r.server // "") | clean(32))
+        }]
+      }
+  ' "$response"
+  rm -f "$response"
+}
+
+validate_image() {
+  local path=$1
+  python3 - "$path" "$max_art_edge" <<'PY'
+import sys
+from PIL import Image
+
+path, max_edge = sys.argv[1], int(sys.argv[2])
+allowed = {"JPEG", "PNG", "WEBP"}
+try:
+    with Image.open(path) as im:
+        im.verify()
+    with Image.open(path) as im:
+        if im.format not in allowed:
+            raise SystemExit(1)
+        w, h = im.size
+        if w <= 0 or h <= 0 or w > max_edge or h > max_edge:
+            raise SystemExit(1)
+        # Force a decode pass so truncated/malicious payloads fail here.
+        im.load()
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+cmd_art() {
+  local url=${1:-}
+  if ! is_https_url "$url"; then
+    jq -cn '{path:""}'
+    return 0
+  fi
+
+  local host
+  host=$(printf '%s' "$url" | sed -E 's#^https://([^/:?#]+).*#\1#')
+  if ! art_host_allowed "$host"; then
+    jq -cn '{path:""}'
+    return 0
+  fi
+
+  local key response final
+  key=$(printf '%s' "$url" | sha256sum | awk '{print $1}')
+  final="$art_dir/$key.img"
+  if [[ -s $final ]]; then
+    local existing
+    existing=$(stat -c '%s' -- "$final" 2>/dev/null || echo 0)
+    if (( existing > 0 && existing <= max_art_bytes )) && validate_image "$final"; then
+      jq -cn --arg path "$final" '{path:$path}'
+      return 0
+    fi
+    rm -f "$final"
+  fi
+
+  response=$(mktemp "$art_dir/fetch.XXXXXX")
+  if ! curl -fsS \
+      --proto '=https' --proto-redir '=https' \
+      --connect-timeout 4 --max-time "$max_art_time" \
+      --max-filesize "$max_art_bytes" \
+      -A "$user_agent" \
+      -o "$response" \
+      "$url" 2>/dev/null
+  then
+    rm -f "$response"
+    jq -cn '{path:""}'
+    return 0
+  fi
+
+  local size
+  size=$(stat -c '%s' -- "$response" 2>/dev/null || echo 0)
+  if (( size <= 0 || size > max_art_bytes )) || ! validate_image "$response"; then
+    rm -f "$response"
+    jq -cn '{path:""}'
+    return 0
+  fi
+
+  mv "$response" "$final"
+  # Drop older art files so the cache cannot grow without bound.
+  find "$art_dir" -type f -name '*.img' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | awk 'NR > 8 { print $2 }' \
+    | while IFS= read -r old; do rm -f "$old"; done
+
+  jq -cn --arg path "$final" '{path:$path}'
+}
+
+case "${1:-}" in
+  meta) cmd_meta ;;
+  art) shift; cmd_art "${1:-}" ;;
+  *)
+    echo "Usage: jradio-fetch meta | art <https-url>" >&2
+    exit 1
+    ;;
+esac

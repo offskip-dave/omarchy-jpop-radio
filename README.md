@@ -1,12 +1,24 @@
 # JPopsuki Radio for Omarchy Quattro
 
-Tune into the public [JPopsuki Radio](http://jpopsuki.eu/media.php) Icecast
+Tune into the public [JPopsuki Radio](https://jpopsuki.eu/media.php) Icecast
 stream from the Omarchy bar. Playback runs through `mpv` + `mpv-mpris`, so
 `omarchy.media` gets the usual play/pause controls and now-playing metadata.
 
-Now-playing (artist, title, album art, listeners) is polled from Centova's
-public streaminfo endpoint. This plugin only uses the advertised public radio
-stream — it does not touch the invite-only JPopsuki tracker or TV VOD.
+This plugin only uses the advertised public radio stream — it does not touch
+the invite-only JPopsuki tracker or TV VOD.
+
+## Security
+
+- **Metadata & artwork** are fetched with `jradio-fetch` over **HTTPS only**
+  (`--proto '=https'`), with hard byte/time ceilings. Bodies are projected
+  through `jq` before QML sees them.
+- **Artwork** is downloaded to `$XDG_RUNTIME_DIR/ofs-jradio/art/`, validated
+  (JPEG/PNG/WebP, max 512 KiB, max 1024×1024) with Pillow, then shown as a
+  local `file://` path. Remote URLs are never bound to `Image`.
+- **Playback** is limited to a fixed Icecast allowlist. The station does not
+  currently offer a working TLS stream; URLs from metadata responses are never
+  used for playback.
+- Remote strings are sanitized and rendered with `textFormat: Text.PlainText`.
 
 ## Install
 
@@ -32,23 +44,23 @@ omarchy plugin enable ofs.jradio --section right
 | Right click bar | Open now-playing panel |
 | Middle click bar | Refresh metadata |
 
-Panel shows station status, current track, Last.fm art when available, and
-listener count.
+Panel shows station status, current track, validated local art when available,
+and listener count.
 
 ## Requirements
 
 - Omarchy Quattro (`omarchy-shell` / Quickshell plugins)
 - `mpv` and `mpv-mpris` (stock on Omarchy)
-- `curl` for metadata polls
+- `curl`, `jq`, `socat`, `python` + Pillow (for art validation)
 
 ## Stream mounts
 
 Settings → Stream mount:
 
-- `stream` (default) — matches Centova's published playlist
-- `autodj` — same AutoDJ feed on the Icecast host
+- `stream` (default) — allowlisted `http://jpopsuki.fm:8000/stream`
+- `autodj` — allowlisted `http://jpopsuki.fm:8000/autodj`
 
-Both are `http://jpopsuki.fm:8000/<mount>` at 192 kbps MP3.
+Both are 192 kbps MP3. Icecast TLS is not available from the station today.
 
 ## Remove
 

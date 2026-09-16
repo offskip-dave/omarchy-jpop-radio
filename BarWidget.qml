@@ -105,6 +105,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
+    // Label is sanitized/truncated in the service; WidgetButton renders PlainText.
     text: root.vertical ? "" : (root.showTitle ? root.glyph + " " + root.label : root.glyph)
     labelVisible: !root.vertical
     hasVisualContent: root.vertical ? root.verticalLines.length > 0 : text !== ""

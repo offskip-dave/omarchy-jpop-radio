@@ -4,6 +4,7 @@ import Quickshell.Io
 import "Model.js" as Model
 
 // Headless singleton: one metadata poller and one mpv session for all bars.
+// Remote metadata/artwork always go through jradio-fetch (HTTPS + byte caps).
 Item {
   id: root
 
@@ -23,6 +24,10 @@ Item {
     var u = Qt.resolvedUrl("jradio-player").toString()
     return u.startsWith("file://") ? u.slice(7) : u
   }
+  readonly property string fetchPath: {
+    var u = Qt.resolvedUrl("jradio-fetch").toString()
+    return u.startsWith("file://") ? u.slice(7) : u
+  }
 
   property bool playing: false
   property int playerPid: 0
@@ -36,12 +41,15 @@ Item {
   property string title: ""
   property string album: ""
   property string imageUrl: ""
+  property string artPath: ""
   property int listeners: 0
   property string bitrate: ""
   property string lastError: ""
   property int metaFailures: 0
+  property string pendingArtUrl: ""
 
   readonly property string trackLine: Model.displayLine(artist, title) || song
+  readonly property string artSource: Model.fileUrl(artPath)
   readonly property string barLabel: {
     if (!playing) return Model.PLAYER_TITLE
     if (!showTitle) return Model.PLAYER_TITLE
@@ -52,39 +60,74 @@ Item {
     var bits = [Model.PLAYER_TITLE]
     if (playing) bits.push("playing")
     else bits.push("stopped")
-    if (trackLine) bits.push(trackLine)
+    if (trackLine) bits.push(Model.sanitizeText(trackLine, Model.MAX_SONG))
     if (listeners > 0) bits.push(listeners + " listeners")
     return bits.join(" · ")
   }
 
   function applyMeta(meta) {
     if (!meta) return
-    root.online = meta.online === true
-    root.station = meta.station || Model.PLAYER_TITLE
-    root.song = meta.song || ""
-    root.artist = meta.artist || ""
-    root.title = meta.title || ""
-    root.album = meta.album || ""
-    root.imageUrl = meta.imageUrl || ""
-    root.listeners = Number(meta.listeners) || 0
-    root.bitrate = meta.bitrate || ""
+
+    var hasTrack = !!(meta.song || meta.artist || meta.title)
+    // HTTPS Centova currently fails closed (bad cert). Do not clobber ICY
+    // metadata or flip the station "offline" while we are already playing.
+    if (!hasTrack && meta.online !== true) {
+      if (!root.playing) root.online = false
+    } else {
+      root.online = meta.online === true
+      root.station = Model.sanitizeText(meta.station || Model.PLAYER_TITLE, Model.MAX_STATION) || Model.PLAYER_TITLE
+      if (meta.song) root.song = Model.sanitizeText(meta.song, Model.MAX_SONG)
+      if (meta.artist) root.artist = Model.sanitizeText(meta.artist, Model.MAX_ARTIST)
+      if (meta.title) root.title = Model.sanitizeText(meta.title, Model.MAX_TITLE)
+      if (meta.album) root.album = Model.sanitizeText(meta.album, Model.MAX_ALBUM)
+      root.listeners = Model.clampInt(meta.listeners, 0, Model.MAX_LISTENERS, 0)
+      if (meta.bitrate) root.bitrate = Model.sanitizeText(meta.bitrate, Model.MAX_BITRATE)
+    }
+
+    var nextArt = Model.safeArtUrl(meta.imageUrl || "")
+    root.imageUrl = nextArt
+    if (!nextArt) {
+      // Keep existing validated art until a replacement URL arrives.
+    } else if (nextArt !== root.pendingArtUrl) {
+      root.fetchArt(nextArt)
+    }
+  }
+
+  function mergeIcy(status) {
+    if (!status) return
+    if (status.icyArtist)
+      root.artist = Model.sanitizeText(status.icyArtist, Model.MAX_ARTIST)
+    if (status.icyTitle)
+      root.title = Model.sanitizeText(status.icyTitle, Model.MAX_TITLE)
+    if (status.icySong && !root.title && !root.artist)
+      root.song = Model.sanitizeText(status.icySong, Model.MAX_SONG)
   }
 
   function applyPlayerStatus(status) {
     if (!status) return
     root.playing = status.playing === true
-    root.playerPid = Number(status.pid) || 0
-    root.playerUrl = status.url || ""
+    root.playerPid = Model.clampInt(status.pid, 0, 4194304, 0)
+    root.playerUrl = Model.isAllowlistedStream(status.url) ? status.url : ""
+    if (root.playing) root.mergeIcy(status)
+  }
+
+  function setError(text) {
+    root.lastError = Model.sanitizeText(text, Model.MAX_ERROR)
   }
 
   function refreshMeta() {
     if (metaProc.running) return
-    metaProc.command = [
-      "curl", "-fsS", "--max-time", "8",
-      "-A", Model.USER_AGENT,
-      Model.CENTOVA_INFO
-    ]
+    // Helper writes a size-capped HTTPS body and prints a projected JSON object.
+    metaProc.command = [root.fetchPath, "meta"]
     metaProc.running = true
+  }
+
+  function fetchArt(url) {
+    var safe = Model.safeArtUrl(url)
+    if (!safe || artProc.running) return
+    root.pendingArtUrl = safe
+    artProc.command = [root.fetchPath, "art", safe]
+    artProc.running = true
   }
 
   function refreshPlayer() {
@@ -125,8 +168,14 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        var text = String(this.text || "")
+        if (text.length > Model.MAX_META_BYTES) {
+          root.metaFailures++
+          root.setError("metadata response too large")
+          return
+        }
         var meta = Model.parseStreamInfo(text)
-        if (!meta || (!meta.song && !meta.artist && !meta.title && !meta.online)) {
+        if (!meta) {
           root.metaFailures++
           return
         }
@@ -137,7 +186,31 @@ Item {
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        if (text && text.trim()) root.lastError = text.trim().split("\n").pop()
+        var err = String(this.text || "")
+        if (err.length > 2048) err = err.slice(0, 2048)
+        if (err.trim()) root.setError(err.trim().split("\n").pop())
+      }
+    }
+  }
+
+  Process {
+    id: artProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var text = String(this.text || "")
+        if (text.length > 2048) text = text.slice(0, 2048)
+        var path = Model.parseArtResult(text)
+        root.artPath = path
+        if (!path) root.pendingArtUrl = ""
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // Art failures stay silent in the UI; drop the pending URL so we retry later.
+        root.pendingArtUrl = ""
+        root.artPath = ""
       }
     }
   }
@@ -146,7 +219,11 @@ Item {
     id: statusProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyPlayerStatus(Model.parseStatusLine(text))
+      onStreamFinished: {
+        var text = String(this.text || "")
+        if (text.length > 8192) text = text.slice(0, 8192)
+        root.applyPlayerStatus(Model.parseStatusLine(text))
+      }
     }
   }
 
@@ -155,6 +232,8 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        var text = String(this.text || "")
+        if (text.length > 8192) text = text.slice(0, 8192)
         root.applyPlayerStatus(Model.parseStatusLine(text))
         root.playerBusy = false
         root.refreshMeta()
@@ -163,14 +242,16 @@ Item {
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        if (text && text.trim()) root.lastError = text.trim().split("\n").pop()
+        var err = String(this.text || "")
+        if (err.length > 2048) err = err.slice(0, 2048)
+        if (err.trim()) root.setError(err.trim().split("\n").pop())
         root.playerBusy = false
       }
     }
     onExited: function(exitCode) {
       root.playerBusy = false
       if (exitCode !== 0 && !root.lastError)
-        root.lastError = "jradio-player exited " + exitCode
+        root.setError("jradio-player exited " + exitCode)
     }
   }
 

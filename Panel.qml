@@ -19,7 +19,7 @@ Panel {
   readonly property string station: service ? service.station : Model.PLAYER_TITLE
   readonly property string trackLine: service ? service.trackLine : ""
   readonly property string album: service ? service.album : ""
-  readonly property string imageUrl: service ? service.imageUrl : ""
+  readonly property string artSource: service ? service.artSource : ""
   readonly property int listeners: service ? service.listeners : 0
   readonly property string bitrate: service ? service.bitrate : ""
   readonly property string lastError: service ? service.lastError : ""
@@ -86,7 +86,6 @@ Panel {
           width: parent.width
           spacing: Style.space(12)
 
-          // Album / station art
           Rectangle {
             id: artFrame
             width: Style.space(88)
@@ -95,19 +94,22 @@ Panel {
             color: Qt.rgba(contentForeground.r, contentForeground.g, contentForeground.b, 0.08)
             clip: true
 
+            // Only local file:// paths produced by jradio-fetch after validation.
             Image {
               id: artImage
               anchors.fill: parent
-              source: root.imageUrl
+              source: root.artSource
               fillMode: Image.PreserveAspectCrop
               asynchronous: true
-              visible: status === Image.Ready
+              cache: false
+              visible: root.artSource !== "" && status === Image.Ready
             }
 
             Text {
               anchors.centerIn: parent
               visible: !artImage.visible
               text: Model.GLYPH
+              textFormat: Text.PlainText
               color: root.mutedForeground
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.displayLarge
@@ -122,6 +124,7 @@ Panel {
             Text {
               width: parent.width
               text: root.station || Model.PLAYER_TITLE
+              textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.title
@@ -133,6 +136,7 @@ Panel {
             Text {
               width: parent.width
               text: root.playing ? "On air" : (root.online ? "Online · stopped" : "Station offline?")
+              textFormat: Text.PlainText
               color: root.playing ? Color.accent : root.mutedForeground
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.caption
@@ -144,6 +148,7 @@ Panel {
               width: parent.width
               visible: root.trackLine !== ""
               text: root.trackLine
+              textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.body
@@ -156,6 +161,7 @@ Panel {
               width: parent.width
               visible: root.album !== ""
               text: root.album
+              textFormat: Text.PlainText
               color: root.mutedForeground
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.caption
@@ -170,6 +176,7 @@ Panel {
           Text {
             visible: root.listeners > 0
             text: root.listeners + " listening"
+            textFormat: Text.PlainText
             color: root.mutedForeground
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
@@ -178,6 +185,7 @@ Panel {
           Text {
             visible: root.bitrate !== ""
             text: root.bitrate
+            textFormat: Text.PlainText
             color: root.mutedForeground
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
@@ -188,6 +196,7 @@ Panel {
           width: parent.width
           visible: root.lastError !== ""
           text: root.lastError
+          textFormat: Text.PlainText
           color: Color.urgent
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption
@@ -213,6 +222,7 @@ Panel {
         Text {
           width: parent.width
           text: "Space play/stop · S stop · R refresh"
+          textFormat: Text.PlainText
           color: root.mutedForeground
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption
