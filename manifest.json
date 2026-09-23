@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ofs.jradio",
   "name": "JPopsuki Radio",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "ofs_dave",
   "license": "MIT",
   "description": "Tune into the public JPopsuki Radio Icecast stream from the Omarchy bar, with now-playing metadata and mpv/MPRIS playback.",

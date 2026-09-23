@@ -7,7 +7,7 @@ umask 077
 : "${XDG_RUNTIME_DIR:?jradio-player requires XDG_RUNTIME_DIR}"
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-version=$(jq -r '.version // "1.1.0"' "$script_dir/manifest.json" 2>/dev/null || echo "1.1.0")
+version=$(jq -r '.version // "1.1.1"' "$script_dir/manifest.json" 2>/dev/null || echo "1.1.1")
 user_agent="ofs.jradio/${version} (Omarchy Quattro; +https://jpopsuki.eu/media.php)"
 player_title="JPopsuki Radio"
 
@@ -24,6 +24,9 @@ socket="$runtime_dir/mpv.sock"
 pid_file="$runtime_dir/player.pid"
 url_file="$runtime_dir/url.txt"
 log_file="$runtime_dir/mpv.log"
+# Hard ceiling on every mpv IPC reply before it enters a shell variable or
+# reaches QML. Idle timeout alone (-T) does not bound bytes.
+max_ipc_bytes=8192
 
 install -d -m 700 "$runtime_dir"
 exec 8>"$runtime_dir/player.lock"
@@ -78,10 +81,57 @@ terminate_tracked_player() {
   cleanup_dead_player
 }
 
+# Stream an mpv IPC exchange into a temp file, capped at max_ipc_bytes+1 so we
+# can detect overflow without ever assigning an unbounded string in bash.
+# Prints the response path on stdout on success. Returns:
+#   0 success (size <= max_ipc_bytes)
+#   1 transport / socket failure
+#   2 over-limit (rejected; file removed)
+ipc_exchange() {
+  local payload=$1
+  local response size
+  [[ -S $socket ]] || return 1
+  response=$(mktemp "$runtime_dir/ipc.XXXXXX")
+  # head -c stops reading after the ceiling; +1 byte signals overflow.
+  if ! printf '%s\n' "$payload" \
+      | socat -T 2 - "UNIX-CONNECT:$socket" 2>/dev/null \
+      | head -c "$((max_ipc_bytes + 1))" > "$response"
+  then
+    rm -f "$response"
+    return 1
+  fi
+  size=$(stat -c '%s' -- "$response" 2>/dev/null || echo 0)
+  if (( size > max_ipc_bytes )); then
+    rm -f "$response"
+    return 2
+  fi
+  printf '%s\n' "$response"
+}
+
+# Load a bounded IPC file into a shell variable only after the size check.
+# Rejects and clears on empty/missing/oversize paths.
+ipc_slurp() {
+  local path=$1
+  local size
+  [[ -n $path && -f $path ]] || return 1
+  size=$(stat -c '%s' -- "$path" 2>/dev/null || echo 0)
+  if (( size <= 0 || size > max_ipc_bytes )); then
+    rm -f "$path"
+    return 1
+  fi
+  # Safe: size is already proven <= max_ipc_bytes.
+  cat "$path"
+  rm -f "$path"
+}
+
 send_command() {
   local payload=$1
-  [[ -S $socket ]] || return 1
-  printf '%s\n' "$payload" | socat -T 2 - "UNIX-CONNECT:$socket" 2>/dev/null
+  local path
+  # Discard the body, but still enforce the byte ceiling so a huge mpv reply
+  # cannot stall or exhaust the helper even when stdout is redirected.
+  path=$(ipc_exchange "$payload") || return 1
+  rm -f "$path"
+  return 0
 }
 
 current_url() {
@@ -100,33 +150,51 @@ url_allowlisted() {
   return 1
 }
 
+# Cap and strip controls from a single ICY field after jq extraction / split.
+bound_field() {
+  local value=$1
+  local max=$2
+  printf '%s' "$value" \
+    | tr -d '\000-\037\177' \
+    | tr -d '<>&`' \
+    | tr -s '[:space:]' ' ' \
+    | head -c "$max"
+}
+
 read_icy() {
-  local reply artist title song
+  local path reply artist title song
   artist=""; title=""; song=""
   if [[ -S $socket ]] && player_alive; then
-    reply=$(printf '%s\n' '{"command":["get_property","metadata"]}' | socat -T 2 - "UNIX-CONNECT:$socket" 2>/dev/null || true)
-    if [[ -n $reply ]]; then
-      artist=$(printf '%s' "$reply" | jq -r '
-        .data // {}
-        | (.artist // .icy_artist // ."icy-artist" // "")
-        | tostring | .[0:120]
-      ' 2>/dev/null || true)
-      title=$(printf '%s' "$reply" | jq -r '
-        .data // {}
-        | (.title // .icy_title // ."icy-title" // "")
-        | tostring | .[0:120]
-      ' 2>/dev/null || true)
-      song=$(printf '%s' "$reply" | jq -r '
-        .data // {}
-        | (."icy-name" // .icy_name // "")
-        | tostring | .[0:200]
-      ' 2>/dev/null || true)
-      if [[ -z $artist && -z $title && -n $song ]]; then
-        :
-      elif [[ -z $artist && -n $title && $title == *" - "* ]]; then
-        artist=${title%% - *}
-        title=${title#* - }
+    # Fail closed on transport error or over-limit: emit empty ICY fields.
+    if path=$(ipc_exchange '{"command":["get_property","metadata"]}'); then
+      if reply=$(ipc_slurp "$path"); then
+        artist=$(printf '%s' "$reply" | jq -r '
+          .data // {}
+          | (.artist // .icy_artist // ."icy-artist" // "")
+          | tostring | .[0:120]
+        ' 2>/dev/null || true)
+        title=$(printf '%s' "$reply" | jq -r '
+          .data // {}
+          | (.title // .icy_title // ."icy-title" // "")
+          | tostring | .[0:120]
+        ' 2>/dev/null || true)
+        song=$(printf '%s' "$reply" | jq -r '
+          .data // {}
+          | (."icy-name" // .icy_name // "")
+          | tostring | .[0:200]
+        ' 2>/dev/null || true)
+        if [[ -z $artist && -z $title && -n $song ]]; then
+          :
+        elif [[ -z $artist && -n $title && $title == *" - "* ]]; then
+          artist=${title%% - *}
+          title=${title#* - }
+        fi
+        artist=$(bound_field "${artist:-}" 120)
+        title=$(bound_field "${title:-}" 120)
+        song=$(bound_field "${song:-}" 200)
       fi
+    else
+      rm -f "$path"
     fi
   fi
   jq -cn \
