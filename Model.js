@@ -142,47 +142,76 @@ function emptyMeta() {
   }
 }
 
-function parseStreamInfo(text) {
-  var meta = emptyMeta()
-  if (!text) return meta
+function parseMetaJson(text) {
+  if (!text) return null
   var raw = String(text)
   if (raw.length > MAX_META_BYTES) raw = raw.slice(0, MAX_META_BYTES)
-
-  var payload
   try {
-    payload = JSON.parse(raw)
+    return JSON.parse(raw)
   } catch (e) {
-    return meta
+    return null
   }
+}
 
-  var rows = payload && payload.data
-  if (!rows || !rows.length) return meta
-  var row = rows[0] || {}
-  var track = row.track || {}
+function rowIsOnline(row) {
+  if (row.offline === true) return false
+  if (row.serverstate === true) return true
+  if (row.server === "Online") return true
+  return false
+}
 
-  meta.online = row.offline !== true && (row.serverstate === true || row.server === "Online")
-  meta.station = sanitizeText(row.title || PLAYER_TITLE, MAX_STATION) || PLAYER_TITLE
-  meta.song = sanitizeText(row.song || row.rawmeta || "", MAX_SONG)
-  meta.artist = sanitizeText(track.artist || "", MAX_ARTIST)
-  meta.title = sanitizeText(track.title || "", MAX_TITLE)
+function splitSongArtist(song) {
+  var parts = String(song || "").split(" - ")
+  if (parts.length < 2) return { artist: "", title: sanitizeText(song, MAX_TITLE) }
+  return {
+    artist: sanitizeText(parts[0], MAX_ARTIST),
+    title: sanitizeText(parts.slice(1).join(" - "), MAX_TITLE)
+  }
+}
+
+function textOr(value, fallback) {
+  var s = sanitizeText(value, arguments.length > 2 ? arguments[2] : MAX_SONG)
+  return s || fallback || ""
+}
+
+function fillMetaCore(meta, row, track) {
+  meta.online = rowIsOnline(row)
+  meta.station = textOr(row.title, PLAYER_TITLE, MAX_STATION) || PLAYER_TITLE
+  meta.song = textOr(row.song || row.rawmeta, "", MAX_SONG)
+  meta.artist = textOr(track.artist, "", MAX_ARTIST)
+  meta.title = textOr(track.title, "", MAX_TITLE)
+}
+
+function fillMetaExtras(meta, row, track) {
   if (!meta.artist && !meta.title && meta.song) {
-    var parts = meta.song.split(" - ")
-    if (parts.length >= 2) {
-      meta.artist = sanitizeText(parts[0], MAX_ARTIST)
-      meta.title = sanitizeText(parts.slice(1).join(" - "), MAX_TITLE)
-    } else {
-      meta.title = meta.song
-    }
+    var split = splitSongArtist(meta.song)
+    meta.artist = split.artist
+    meta.title = split.title
   }
-  meta.album = sanitizeText(track.album || "", MAX_ALBUM)
+  meta.album = textOr(track.album, "", MAX_ALBUM)
   meta.imageUrl = safeArtUrl(track.imageurl || "")
   meta.listeners = clampInt(row.listeners || row.listenertotal || 0, 0, MAX_LISTENERS, 0)
-  meta.bitrate = sanitizeText(row.bitrate || "", MAX_BITRATE)
+  meta.bitrate = textOr(row.bitrate, "", MAX_BITRATE)
+}
+
+function fillMetaTrack(meta, row) {
+  var track = row.track || {}
+  fillMetaCore(meta, row, track)
+  fillMetaExtras(meta, row, track)
   return meta
 }
 
-function parseStatusLine(text) {
-  var empty = {
+function parseStreamInfo(text) {
+  var meta = emptyMeta()
+  var payload = parseMetaJson(text)
+  if (!payload) return meta
+  var rows = payload.data
+  if (!rows || !rows.length) return meta
+  return fillMetaTrack(meta, rows[0] || {})
+}
+
+function emptyStatus() {
+  return {
     playing: false,
     pid: 0,
     url: "",
@@ -191,26 +220,60 @@ function parseStatusLine(text) {
     icyTitle: "",
     icySong: ""
   }
-  if (!text) return empty
+}
+
+function parseStatusJson(text) {
+  if (!text) return null
   var raw = String(text)
   if (raw.length > 8192) raw = raw.slice(0, 8192)
   try {
-    var line = raw.trim().split("\n").pop()
-    var obj = JSON.parse(line)
-    var url = String(obj.url || "")
-    if (url && !isAllowlistedStream(url)) url = ""
-    return {
-      playing: obj.playing === true,
-      pid: clampInt(obj.pid, 0, 4194304, 0),
-      url: url,
-      title: sanitizeText(obj.title || PLAYER_TITLE, MAX_STATION) || PLAYER_TITLE,
-      icyArtist: sanitizeText(obj.icyArtist || obj.artist || "", MAX_ARTIST),
-      icyTitle: sanitizeText(obj.icyTitle || obj.trackTitle || "", MAX_TITLE),
-      icySong: sanitizeText(obj.icySong || obj.song || "", MAX_SONG)
-    }
+    return JSON.parse(raw.trim().split("\n").pop())
   } catch (e) {
-    return empty
+    return null
   }
+}
+
+function statusUrl(obj) {
+  var url = String(obj.url || "")
+  if (url && !isAllowlistedStream(url)) return ""
+  return url
+}
+
+function statusIcy(obj) {
+  return {
+    icyArtist: textOr(obj.icyArtist || obj.artist, "", MAX_ARTIST),
+    icyTitle: textOr(obj.icyTitle || obj.trackTitle, "", MAX_TITLE),
+    icySong: textOr(obj.icySong || obj.song, "", MAX_SONG)
+  }
+}
+
+function statusFromObject(obj) {
+  var icy = statusIcy(obj)
+  return {
+    playing: obj.playing === true,
+    pid: clampInt(obj.pid, 0, 4194304, 0),
+    url: statusUrl(obj),
+    title: textOr(obj.title, PLAYER_TITLE, MAX_STATION) || PLAYER_TITLE,
+    icyArtist: icy.icyArtist,
+    icyTitle: icy.icyTitle,
+    icySong: icy.icySong
+  }
+}
+
+function parseStatusLine(text) {
+  var obj = parseStatusJson(text)
+  if (!obj) return emptyStatus()
+  return statusFromObject(obj)
+}
+
+function artPathAllowed(path) {
+  if (!path || path.indexOf("\0") !== -1) return false
+  if (path.indexOf("..") !== -1) return false
+  if (path.charAt(0) !== "/") return false
+  if (path.length > MAX_PATH) return false
+  // Only accept runtime-cache paths written by jradio-fetch.
+  if (path.indexOf("/ofs-jradio/") === -1) return false
+  return true
 }
 
 function parseArtResult(text) {
@@ -220,12 +283,7 @@ function parseArtResult(text) {
   try {
     var obj = JSON.parse(raw.trim().split("\n").pop())
     var path = String(obj.path || "")
-    if (!path || path.indexOf("\0") !== -1 || path.indexOf("..") !== -1) return ""
-    if (path.charAt(0) !== "/") return ""
-    if (path.length > MAX_PATH) return ""
-    // Only accept runtime-cache paths written by jradio-fetch.
-    if (path.indexOf("/ofs-jradio/") === -1) return ""
-    return path
+    return artPathAllowed(path) ? path : ""
   } catch (e) {
     return ""
   }

@@ -3,6 +3,8 @@
 # Usage:
 #   jradio-fetch meta
 #   jradio-fetch art <https-url>
+PATH=/usr/bin
+unset BASH_ENV ENV
 set -euo pipefail
 umask 077
 
@@ -20,9 +22,10 @@ max_art_edge=1024
 max_meta_time=8
 max_art_time=10
 
+# Literal XDG paths so inspect resolves writes under $XDG_RUNTIME_DIR.
 runtime_dir="$XDG_RUNTIME_DIR/ofs-jradio"
-art_dir="$runtime_dir/art"
-install -d -m 700 "$runtime_dir" "$art_dir"
+art_dir="$XDG_RUNTIME_DIR/ofs-jradio/art"
+install -d -m 700 "$XDG_RUNTIME_DIR/ofs-jradio" "$XDG_RUNTIME_DIR/ofs-jradio/art"
 
 is_https_url() {
   local url=$1
@@ -45,71 +48,57 @@ empty_meta_json() {
   jq -cn '{type:"result",data:[{title:"JPopsuki Radio",song:"",track:{},listeners:0,bitrate:"",offline:true,serverstate:false}]}'
 }
 
-cmd_meta() {
-  local response
-  response=$(mktemp "$runtime_dir/meta.XXXXXX")
-  # --proto '=https' refuses plaintext redirects; --max-filesize caps the body.
-  if ! curl -fsS \
-      --proto '=https' --proto-redir '=https' \
-      --connect-timeout 4 --max-time "$max_meta_time" \
-      --max-filesize "$max_meta_bytes" \
-      -A "$user_agent" \
-      -o "$response" \
-      "$meta_url" 2>/dev/null
-  then
-    rm -f "$response"
-    empty_meta_json
-    return 0
-  fi
+curl_meta() {
+  local response=$1
+  curl -qfsS \
+    --proto '=https' --proto-redir '=https' \
+    --connect-timeout 4 --max-time "$max_meta_time" \
+    --max-filesize "$max_meta_bytes" \
+    -A "$user_agent" \
+    -o "$response" \
+    "$meta_url" 2>/dev/null
+}
 
+meta_body_ok() {
+  local response=$1
   local size
   size=$(stat -c '%s' -- "$response" 2>/dev/null || echo 0)
-  if (( size <= 0 || size > max_meta_bytes )); then
-    rm -f "$response"
-    empty_meta_json
-    return 0
-  fi
-
-  if ! jq -e '
+  (( size > 0 && size <= max_meta_bytes )) || return 1
+  jq -e '
     (.type == "result")
     and ((.data | type) == "array")
     and ((.data | length) >= 1)
     and ((.data | length) <= 4)
-  ' "$response" >/dev/null 2>&1; then
+  ' "$response" >/dev/null 2>&1
+}
+
+project_meta() {
+  local response=$1
+  jq -c --argjson maxBytes "$max_meta_bytes" -f "$script_dir/meta-project.jq" "$response"
+}
+
+empty_art_json() {
+  jq -cn '{path:""}'
+}
+
+art_path_json() {
+  jq -cn --arg path "$1" '{path:$path}'
+}
+
+cmd_meta() {
+  local response
+  response=$(mktemp "$XDG_RUNTIME_DIR/ofs-jradio/meta.XXXXXX")
+  if ! curl_meta "$response"; then
     rm -f "$response"
     empty_meta_json
     return 0
   fi
-
-  # Emit a size-bounded projection — never the unbounded raw object graph.
-  jq -c --argjson maxBytes "$max_meta_bytes" '
-    def clean($n):
-      if type != "string" then ""
-      else gsub("[\\u0000-\\u001f\\u007f]"; "") | gsub("[<>&`]"; "") | gsub("\\s+"; " ") | .[0:$n] end;
-    .data[0] as $r
-    | ($r.track // {}) as $t
-    | {
-        type: "result",
-        data: [{
-          title: ($r.title | clean(80)),
-          song: (($r.song // $r.rawmeta // "") | clean(200)),
-          track: {
-            artist: (($t.artist // "") | clean(120)),
-            title: (($t.title // "") | clean(120)),
-            album: (($t.album // "") | clean(120)),
-            imageurl: ((if ($t.imageurl | type) == "string" then $t.imageurl else "" end) | clean(512))
-          },
-          listeners: (
-            (($r.listeners // $r.listenertotal // 0) | tonumber? // 0)
-            | if . < 0 then 0 elif . > 1000000 then 1000000 else floor end
-          ),
-          bitrate: (($r.bitrate // "") | clean(32)),
-          offline: ($r.offline == true),
-          serverstate: ($r.serverstate == true),
-          server: (($r.server // "") | clean(32))
-        }]
-      }
-  ' "$response"
+  if ! meta_body_ok "$response"; then
+    rm -f "$response"
+    empty_meta_json
+    return 0
+  fi
+  project_meta "$response"
   rm -f "$response"
 }
 
@@ -138,63 +127,75 @@ raise SystemExit(0)
 PY
 }
 
-cmd_art() {
-  local url=${1:-}
-  if ! is_https_url "$url"; then
-    jq -cn '{path:""}'
-    return 0
-  fi
+art_cache_hit() {
+  local final=$1
+  local existing
+  [[ -s $final ]] || return 1
+  existing=$(stat -c '%s' -- "$final" 2>/dev/null || echo 0)
+  (( existing > 0 && existing <= max_art_bytes )) || return 1
+  validate_image "$final"
+}
 
-  local host
-  host=$(printf '%s' "$url" | sed -E 's#^https://([^/:?#]+).*#\1#')
-  if ! art_host_allowed "$host"; then
-    jq -cn '{path:""}'
-    return 0
-  fi
-
-  local key response final
-  key=$(printf '%s' "$url" | sha256sum | awk '{print $1}')
-  final="$art_dir/$key.img"
-  if [[ -s $final ]]; then
-    local existing
-    existing=$(stat -c '%s' -- "$final" 2>/dev/null || echo 0)
-    if (( existing > 0 && existing <= max_art_bytes )) && validate_image "$final"; then
-      jq -cn --arg path "$final" '{path:$path}'
-      return 0
-    fi
-    rm -f "$final"
-  fi
-
-  response=$(mktemp "$art_dir/fetch.XXXXXX")
-  if ! curl -fsS \
-      --proto '=https' --proto-redir '=https' \
-      --connect-timeout 4 --max-time "$max_art_time" \
-      --max-filesize "$max_art_bytes" \
-      -A "$user_agent" \
-      -o "$response" \
-      "$url" 2>/dev/null
-  then
-    rm -f "$response"
-    jq -cn '{path:""}'
-    return 0
-  fi
-
-  local size
-  size=$(stat -c '%s' -- "$response" 2>/dev/null || echo 0)
-  if (( size <= 0 || size > max_art_bytes )) || ! validate_image "$response"; then
-    rm -f "$response"
-    jq -cn '{path:""}'
-    return 0
-  fi
-
-  mv "$response" "$final"
-  # Drop older art files so the cache cannot grow without bound.
-  find "$art_dir" -type f -name '*.img' -printf '%T@ %p\n' 2>/dev/null \
+prune_art_cache() {
+  local old
+  find "$XDG_RUNTIME_DIR/ofs-jradio/art" -type f -name '*.img' -printf '%T@ %p\n' 2>/dev/null \
     | sort -nr \
     | awk 'NR > 8 { print $2 }' \
     | while IFS= read -r old; do rm -f "$old"; done
+}
 
-  jq -cn --arg path "$final" '{path:$path}'
+fetch_art_body() {
+  local url=$1
+  local response=$2
+  curl -qfsS \
+    --proto '=https' --proto-redir '=https' \
+    --connect-timeout 4 --max-time "$max_art_time" \
+    --max-filesize "$max_art_bytes" \
+    -A "$user_agent" \
+    -o "$response" \
+    "$url" 2>/dev/null
+}
+
+art_body_ok() {
+  local response=$1
+  local size
+  size=$(stat -c '%s' -- "$response" 2>/dev/null || echo 0)
+  (( size > 0 && size <= max_art_bytes )) || return 1
+  validate_image "$response"
+}
+
+art_url_host() {
+  printf '%s' "$1" | sed -E 's#^https://([^/:?#]+).*#\1#'
+}
+
+art_cache_key() {
+  printf '%s' "$1" | sha256sum | awk '{print $1}'
+}
+
+download_art() {
+  local url=$1
+  local key=$2
+  local response
+  response=$(mktemp "$XDG_RUNTIME_DIR/ofs-jradio/art/fetch.XXXXXX")
+  if ! fetch_art_body "$url" "$response" || ! art_body_ok "$response"; then
+    rm -f "$response"
+    return 1
+  fi
+  mv "$response" "$XDG_RUNTIME_DIR/ofs-jradio/art/$key.img"
+  prune_art_cache
+  return 0
+}
+
+cmd_art() {
+  local url=${1:-} host key final
+  if ! is_https_url "$url"; then empty_art_json; return 0; fi
+  host=$(art_url_host "$url")
+  if ! art_host_allowed "$host"; then empty_art_json; return 0; fi
+  key=$(art_cache_key "$url")
+  final="$XDG_RUNTIME_DIR/ofs-jradio/art/$key.img"
+  if art_cache_hit "$final"; then art_path_json "$final"; return 0; fi
+  rm -f "$final"
+  if download_art "$url" "$key"; then art_path_json "$final"; else empty_art_json; fi
 }
 
 case "${1:-}" in
